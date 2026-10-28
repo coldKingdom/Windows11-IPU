@@ -1,99 +1,99 @@
-<%@ WebHandler Language="C#" Class="MoveComputer" %>
-
-using System;
-using System.Collections.Generic;
-using System.DirectoryServices;
-using System.Security.Principal;
-using System.Text;
-using System.Web;
-
-public class MoveComputer : IHttpHandler
-{
-    // ANDRA: Samma skrivbara DC och samma AD-doman for alla OU.
-    private const string Dc = "dc01.contoso.local";
-    private const string SourceOu = "OU=Staging,DC=contoso,DC=local";
-    private static readonly HashSet<string> AllowedTargets =
-        new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-        {
-            "OU=Workstations,DC=contoso,DC=local",
-            "OU=Kiosks,DC=contoso,DC=local"
-        };
-
-    public bool IsReusable { get { return false; } }
-
-    public void ProcessRequest(HttpContext context)
-    {
-        context.Response.ContentType = "text/plain; charset=utf-8";
-        context.Response.TrySkipIisCustomErrors = true;
-        context.Response.Cache.SetCacheability(HttpCacheability.NoCache);
-        context.Response.Cache.SetNoStore();
-
-        if (!context.Request.IsSecureConnection)
-        { Reply(context, 403, "HTTPS required."); return; }
-
-        if (context.Request.HttpMethod != "POST")
-        {
-            context.Response.AddHeader("Allow", "POST");
-            Reply(context, 405, "POST required."); return;
-        }
-
-        WindowsIdentity identity = context.User == null ? null :
-            context.User.Identity as WindowsIdentity;
-        if (identity == null || !identity.IsAuthenticated || identity.User == null)
-        { Reply(context, 401, "Windows authentication required."); return; }
-
-        string targetOu = context.Request.Form["TargetOU"];
-        if (String.IsNullOrWhiteSpace(targetOu) || !AllowedTargets.Contains(targetOu))
-        { Reply(context, 400, "TargetOU is not allowed."); return; }
-
-        try
-        {
-            // Anroparens SID kommer fran IIS, aldrig fran formularet.
-            byte[] sid = new byte[identity.User.BinaryLength];
-            identity.User.GetBinaryForm(sid, 0);
-            StringBuilder escapedSid = new StringBuilder();
-            foreach (byte b in sid)
-                escapedSid.Append('\\').Append(b.ToString("X2"));
-
-            // Krav pa datorobjekt och WORKSTATION_TRUST_ACCOUNT.
-            // Ett anvandarkonto med namn som slutar pa $ accepteras inte.
-            string filter = "(&(objectCategory=computer)(objectSid=" + escapedSid +
-                ")(userAccountControl:1.2.840.113556.1.4.803:=4096))";
-
-            using (DirectoryEntry source = OpenOu(SourceOu))
-            using (DirectoryEntry target = OpenOu(targetOu))
-            using (DirectoryEntry computer = FindComputer(source, filter))
+                return Result(200, "MOVED", "Computer moved.");
+            }
+            finally
             {
-                if (computer == null)
-                {
-                    // Gor ett upprepat anrop till samma mal ofarligt.
-                    using (DirectoryEntry existing = FindComputer(target, filter))
-                    {
-                        if (existing != null)
-                        { Reply(context, 200, "Already in target OU."); return; }
-                    }
-                    Reply(context, 403, "Caller is not a workstation in the permitted source OU.");
-                    return;
-                }
-
-                computer.MoveTo(target);
-                computer.CommitChanges();
-                Reply(context, 200, "Computer moved.");
+                if (computer != null) computer.Dispose();
             }
         }
-        catch (Exception ex)
+    }
+
+    // Fristaende beslutslogik kan testas utan AD eller natverksanrop.
+    internal static MoveOutcome ResolveMove(Func<Guid?> findSource, Func<Guid?> findTarget,
+        Action move, Action<Exception> recordMoveError)
+    {
+        Guid? original = findSource();
+        if (!original.HasValue)
         {
-            string errorId = Guid.NewGuid().ToString("N");
-            // Konfigurera en Trace-listener pa servern for detaljerad fellogg.
-            System.Diagnostics.Trace.TraceError("OU move {0}: {1}", errorId, ex);
-            context.Response.AppendToLog(" OUmoveError=" + errorId);
-            Reply(context, 500, "OU move failed. Reference: " + errorId);
+            if (findTarget().HasValue) return MoveOutcome.AlreadyInTarget;
+            throw new CallerNotAllowedException();
         }
+        try { move(); }
+        catch (Exception moveError)
+        {
+            recordMoveError(moveError);
+            try
+            {
+                Guid? current = findTarget();
+                if (current.HasValue && current.Value == original.Value)
+                    return MoveOutcome.VerifiedAfterError;
+            }
+            catch (Exception verificationError)
+            {
+                // Bevara ursprungligt fel om efterkontrollen ocksa misslyckas.
+                recordMoveError(new AggregateException("Move and target verification failed.", moveError, verificationError));
+            }
+            throw;
+        }
+        return MoveOutcome.Moved;
+    }
+
+    internal static HandlerResult ClassifyError(Exception ex)
+    {
+        if (ex is AuditUnavailableException)
+            return Result(503, "AUDIT_UNAVAILABLE", "Audit logging unavailable. No move was attempted.");
+        if (ex is CallerNotAllowedException)
+            return Result(403, "CALLER_NOT_ALLOWED", "Caller is not a workstation in the permitted source or target OU.");
+        if (ex is HttpRequestValidationException)
+            return Result(400, "INVALID_FORM", "Invalid form data.");
+        HttpException httpError = ex as HttpException;
+        if (httpError != null && (httpError.GetHttpCode() == 400 || httpError.GetHttpCode() == 413))
+            return Result(httpError.GetHttpCode(), "INVALID_REQUEST", "Invalid request.");
+        COMException directoryError = ex as COMException;
+        if (ex is UnauthorizedAccessException || (directoryError != null &&
+            (directoryError.ErrorCode == unchecked((int)0x80070005) ||
+             directoryError.ErrorCode == unchecked((int)0x80072098))))
+            return Result(403, "AD_ACCESS_DENIED", "AD operation not permitted. Check service account permissions.");
+        if (ex is TimeoutException || (directoryError != null &&
+            (directoryError.ErrorCode == unchecked((int)0x8007203A) ||
+             directoryError.ErrorCode == unchecked((int)0x8007200E) ||
+             directoryError.ErrorCode == unchecked((int)0x8007200F) ||
+             directoryError.ErrorCode == unchecked((int)0x80072022))))
+            return Result(503, "AD_UNAVAILABLE", "AD temporarily unavailable. Move outcome may be unknown; retry the same target.");
+        return Result(500, "INTERNAL_ERROR", "OU move failed. See the server log using the reference ID.");
+    }
+
+    internal static void WriteAudit(string directory, AuditRecord audit, string phase)
+    {
+        if (String.IsNullOrWhiteSpace(directory) || !Path.IsPathRooted(directory))
+            throw new ConfigurationErrorsException("OUmove.LogDirectory must be an absolute directory path.");
+        // Katalog och ACL ska skapas av administrator, utanfor webbplatsen.
+        string file = Path.Combine(directory, "OUmove_" + DateTime.UtcNow.ToString("yyyyMMdd", CultureInfo.InvariantCulture) +
+            "_" + LogInstance + ".log");
+        string line = String.Join("\t", new string[] {
+            DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture), audit.RequestId,
+            LogField(phase), audit.Status.ToString(CultureInfo.InvariantCulture),
+            LogField(audit.Outcome), LogField(audit.Caller), LogField(audit.Sid),
+            LogField(audit.ComputerGuid), LogField(SourceOu), LogField(audit.SourceDn),
+            LogField(audit.Target), LogField(audit.Error)
+        });
+        lock (LogLock)
+        {
+            using (FileStream stream = new FileStream(file, FileMode.Append, FileAccess.Write, FileShare.Read))
+            using (StreamWriter writer = new StreamWriter(stream, new UTF8Encoding(false)))
+                writer.WriteLine(line);
+        }
+    }
+
+    private static string LogField(string value)
+    {
+        value = value ?? "";
+        if (value.Length > 16384) value = value.Substring(0, 16384) + "[truncated]";
+        return value.Replace("\\", "\\\\").Replace("\r", "\\r").Replace("\n", "\\n").Replace("\t", "\\t");
     }
 
     private static DirectoryEntry OpenOu(string dn)
     {
-        // Inga klientcredentials: anvander apppoolens konto.
+        // Inga klientcredentials: apppoolens konto anvands.
         return new DirectoryEntry("LDAP://" + Dc + "/" + dn, null, null,
             AuthenticationTypes.Secure | AuthenticationTypes.Signing |
             AuthenticationTypes.Sealing | AuthenticationTypes.ServerBind);
@@ -103,7 +103,6 @@ public class MoveComputer : IHttpHandler
     {
         using (DirectorySearcher search = new DirectorySearcher(ou))
         {
-            // Endast direkt i angivet OU, inte dess under-OU.
             search.SearchScope = SearchScope.OneLevel;
             search.Filter = filter;
             search.SizeLimit = 1;
@@ -114,9 +113,16 @@ public class MoveComputer : IHttpHandler
         }
     }
 
-    private static void Reply(HttpContext context, int status, string message)
+    private static void AppendIisLog(HttpContext context, string message)
     {
-        context.Response.StatusCode = status;
-        context.Response.Write(message);
+        try { context.Response.AppendToLog(message); }
+        catch { /* IIS-loggfel far inte andra ett genomfort flyttresultat. */ }
     }
-}
+
+    private static HandlerResult Result(int status, string code, string message)
+    { return new HandlerResult { Status = status, Code = code, Message = message }; }
+
+    internal enum MoveOutcome { Moved, AlreadyInTarget, VerifiedAfterError }
+    internal class HandlerResult { public int Status; public string Code; public string Message; }
+    internal class CallerNotAllowedException : Exception { }
+    internal class AuditUnavailableException : Exception
