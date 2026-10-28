@@ -1,4 +1,4 @@
-# Kor i Windows PowerShell 5.1 som SYSTEM, efter domananslutning och omstart.
+# Kör i Windows PowerShell 5.1 som SYSTEM, efter domänanslutning och omstart.
 $ErrorActionPreference = 'Stop'
 
 function Set-CertificateValidationCallback {
@@ -28,15 +28,49 @@ function Set-CertificateValidationCallback {
     $Script:CertificateValidationCallbackEnabled = $true
 }
 
-# ANDRA dessa tva varden.
+function Get-HttpErrorResponse {
+    param([System.Management.Automation.ErrorRecord]$Failure)
+    $exception = $Failure.Exception
+    while ($null -ne $exception) {
+        if ($exception -is [Net.WebException] -and $null -ne $exception.Response) {
+            return $exception.Response
+        }
+        $exception = $exception.InnerException
+    }
+    return $null
+}
+
+function Get-RetryDelaySeconds {
+    param([string]$RetryAfter, [int]$DefaultSeconds = 10)
+    $header = $RetryAfter.Trim()
+    [long]$seconds = 0
+    if ([long]::TryParse($header, [Globalization.NumberStyles]::None,
+        [Globalization.CultureInfo]::InvariantCulture, [ref]$seconds)) {
+        return $seconds
+    }
+    [DateTimeOffset]$retryDate = [DateTimeOffset]::MinValue
+    if ([DateTimeOffset]::TryParseExact($header, 'r',
+        [Globalization.CultureInfo]::InvariantCulture,
+        [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$retryDate)) {
+        return [Math]::Max(0, [Math]::Ceiling(($retryDate - [DateTimeOffset]::UtcNow).TotalSeconds))
+    }
+    return $DefaultSeconds
+}
+
+# ÄNDRA dessa två värden.
 $uri = 'https://iis01.contoso.local/OUmove/MoveComputer.ashx'
 $targetOu = 'OU=Workstations,DC=contoso,DC=local'
+
+# Tre försök totalt, inklusive det första. Retry endast vid HTTP 503.
+$maxAttempts = 3
+$defaultRetryDelaySeconds = 10
+$maxRetryDelaySeconds = 60
 
 $exitCode = 1
 $transcriptStarted = $false
 
 try {
-    # TS-variabler lases via COM; de ar inte automatiskt miljo-variabler.
+    # TS-variabler läses via COM; de är inte automatiskt miljö-variabler.
     $tsEnvironment = $null
     try { $tsEnvironment = New-Object -ComObject Microsoft.SMS.TSEnvironment }
     catch { } # Manuell korning utan aktiv Task Sequence ar ocksa tillaten.
@@ -60,35 +94,75 @@ try {
     Write-Host ('[{0}] Startar OU-flytt.' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
     Write-Host ('Dator: {0}' -f $env:COMPUTERNAME)
     Write-Host ('Lokalt konto: {0}' -f [Security.Principal.WindowsIdentity]::GetCurrent().Name)
-    Write-Host ('Loggkatalog fran: {0}' -f $logSource)
+    Write-Host ('Loggkatalog från: {0}' -f $logSource)
     Write-Host ('Transcript: {0}' -f $logFile)
     Write-Host ('URL: {0}' -f $uri)
-    Write-Host ('Begart mal-OU: {0}' -f $targetOu)
+    Write-Host ('Begärt mål-OU: {0}' -f $targetOu)
 
     if (([uri]$uri).Scheme -ne 'https') { throw 'URL must use HTTPS.' }
     Write-Host 'Aktiverar Set-CertificateValidationCallback.'
     Set-CertificateValidationCallback
-    Write-Host 'Certifikatfunktionen ar anropad. En eventuell befintlig callback behalls.'
+    Write-Host 'Certifikatfunktionen är anropad. En eventuell befintlig callback behålls.'
 
-    Write-Host 'Skickar POST med Windows-standardcredentials. Vid korning som SYSTEM anvands datorns domankonto for natverksautentisering.'
-    $result = Invoke-RestMethod -Uri $uri -Method Post `
-        -UseDefaultCredentials `
-        -ContentType 'application/x-www-form-urlencoded' `
-        -Body @{ TargetOU = $targetOu } `
-        -MaximumRedirection 0 -TimeoutSec 90 -ErrorAction Stop
+    Write-Host 'Skickar POST med Windows-standardcredentials. Vid körning som SYSTEM används datorns domänkonto för nätverksautentisering.'
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        Write-Host ('[{0}] Försök {1} av {2}.' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $attempt, $maxAttempts)
+        try {
+            $result = Invoke-RestMethod -Uri $uri -Method Post `
+                -UseDefaultCredentials `
+                -ContentType 'application/x-www-form-urlencoded' `
+                -Body @{ TargetOU = $targetOu } `
+                -MaximumRedirection 0 -TimeoutSec 90 -ErrorAction Stop
+            break
+        }
+        catch {
+            $attemptFailure = $_
+            $httpResponse = Get-HttpErrorResponse -Failure $attemptFailure
+            $statusCode = $null
+            $retryAfter = ''
+            if ($null -ne $httpResponse) {
+                $statusCode = [int]$httpResponse.StatusCode
+                $retryAfter = [string]$httpResponse.Headers['Retry-After']
+                Write-Host ('HTTP-status: {0}; referens-ID: {1}' -f $statusCode, $httpResponse.Headers['X-OUmove-RequestId'])
+                try { $httpResponse.Close() } catch { }
+            }
+            Write-Host ('Försök {0} misslyckades: {1}' -f $attempt, $attemptFailure.Exception.Message)
+            if ($attemptFailure.ErrorDetails.Message) {
+                Write-Host ('Felsvar från servern: {0}' -f $attemptFailure.ErrorDetails.Message)
+            }
+
+            if ($statusCode -ne 503) {
+                Write-Host 'Inget återförsök: felet är inte HTTP 503.'
+                throw
+            }
+            if ($attempt -ge $maxAttempts) {
+                Write-Host 'Maximalt antal försök uppnått.'
+                throw
+            }
+            $delaySeconds = Get-RetryDelaySeconds -RetryAfter $retryAfter -DefaultSeconds $defaultRetryDelaySeconds
+            if ($delaySeconds -gt $maxRetryDelaySeconds) {
+                # Avbryt hellre än att återförsöka tidigare än servern tillåter.
+                Write-Host ('Inget återförsök: Retry-After överstiger gräns på {0} sekunder.' -f $maxRetryDelaySeconds)
+                throw
+            }
+            Write-Host ('Väntar {0} sekunder före nästa försök med samma mål-OU.' -f $delaySeconds)
+            Start-Sleep -Seconds $delaySeconds
+        }
+    }
 
     Write-Host ('Serversvar: {0}' -f $result)
-    Write-Host 'Anropet lyckades. Servern bekraftar flytt eller att datorn redan ligger i mal-OU.'
+    Write-Host 'Anropet lyckades. Servern bekräftar flytt eller att datorn redan ligger i mål-OU.'
     $exitCode = 0
 }
 catch {
     $failure = $_
     Write-Host ('FEL: OU-flytt misslyckades: {0}' -f $failure.Exception.Message)
-    if ($failure.Exception -is [Net.WebException] -and $null -ne $failure.Exception.Response) {
-        Write-Host ('HTTP-status: {0}' -f [int]$failure.Exception.Response.StatusCode)
+    $failedResponse = Get-HttpErrorResponse -Failure $failure
+    if ($null -ne $failedResponse) {
+        Write-Host ('HTTP-status: {0}' -f [int]$failedResponse.StatusCode)
     }
     if ($failure.ErrorDetails.Message) {
-        Write-Host ('Felsvar fran servern: {0}' -f $failure.ErrorDetails.Message)
+        Write-Host ('Felsvar från servern: {0}' -f $failure.ErrorDetails.Message)
     }
 }
 finally {
