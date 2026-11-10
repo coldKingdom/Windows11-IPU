@@ -1,11 +1,14 @@
 
 param(
+    [string[]]$Cycles = @('HardwareInventory', 'DiscoveryData'),
+
+    [ValidateRange(1, 120)]
     [int]$TimeoutMinutes = 20
 )
 
 $ErrorActionPreference = 'Stop'
 
-# Log path
+# CMTrace logging
 try {
     $tsEnv = New-Object -ComObject Microsoft.SMS.TSEnvironment
     $logPath = $tsEnv.Value('_SMSTSLogPath')
@@ -37,14 +40,17 @@ function Write-Log {
         $offset,
         $now.ToString('MM-dd-yyyy'),
         $Type,
-        $PID
+        [System.Threading.Thread]::CurrentThread.ManagedThreadId
 
     Add-Content -Path $logFile -Value $line -Encoding UTF8
-    Write-Output $Message
+    Write-Host $Message
 }
 
 function Invoke-CCMMethod {
-    param($Method, $Arguments)
+    param(
+        [string]$Method,
+        [hashtable]$Arguments
+    )
 
     $result = Invoke-CimMethod -Namespace 'root\ccm' `
         -ClassName SMS_Client -MethodName $Method `
@@ -55,63 +61,185 @@ function Invoke-CCMMethod {
     }
 }
 
-# Inventory actions
-$actions = @(
-    @{
-        Name     = 'Hardware Inventory'
-        Schedule = '{00000000-0000-0000-0000-000000000101}'
-        Status   = '{00000000-0000-0000-0000-000000000001}'
-    },
-    @{
-        Name     = 'Discovery Data'
-        Schedule = '{00000000-0000-0000-0000-000000000103}'
-        Status   = '{00000000-0000-0000-0000-000000000003}'
-    }
-)
+# Microsoft-documented ConfigMgr schedules
+# Values are the final three digits of the schedule GUID
+$cycleIds = [ordered]@{
+    HardwareInventoryAction       = '001'
+    SoftwareInventoryAction       = '002'
+    DiscoveryDataRecord           = '003'
+    FileCollectionAction          = '010'
+    IDMIFCollectionAction         = '011'
+    ClientMachineAuthentication   = '012'
+    MachinePolicyRequest          = '021'
+    MachinePolicyEvaluation       = '022'
+    RefreshDefaultMP              = '023'
+    LocationRefresh               = '024'
+    LocationTimeoutRefresh        = '025'
+    UserPolicyRequest             = '026'
+    UserPolicyEvaluation          = '027'
+    SoftwareMeteringReport        = '031'
+    SourceUpdateMessage           = '032'
+    ClearProxyCache               = '037'
+    MachinePolicyCleanup          = '040'
+    UserPolicyCleanup             = '041'
+    MachinePolicyValidation       = '042'
+    UserPolicyValidation          = '043'
+    RefreshCertificates           = '051'
+    PeerDPStatusReport            = '061'
+    PeerDPPackageCheck            = '062'
+    SoftwareUpdatesInstall        = '063'
+    HardwareInventory             = '101'
+    SoftwareInventory             = '102'
+    DiscoveryData                 = '103'
+    FileCollection                = '104'
+    IDMIFCollection               = '105'
+    SoftwareMetering              = '106'
+    WindowsInstallerSourceUpdate  = '107'
+    SoftwareUpdateEvaluation      = '108'
+    BranchDPMaintenance           = '109'
+    SendUnsentStateMessages       = '111'
+    StateSystemPolicyCleanup      = '112'
+    SoftwareUpdateScan            = '113'
+    UpdateStorePolicy             = '114'
+    StateSystemBulkSendHigh       = '115'
+    StateSystemBulkSendLow        = '116'
+    ApplicationPolicyAction       = '121'
+    ApplicationUserPolicyAction   = '122'
+    ApplicationEvaluation         = '123'
+    PowerManagementSummarizer     = '131'
+    EndpointDeploymentReevaluate  = '221'
+    EndpointAMPolicyReevaluate    = '222'
+    ExternalEventDetection        = '223'
+}
+
+# Cycles with InventoryActionStatus reporting
+$inventoryIds = @{
+    HardwareInventory = '001'
+    SoftwareInventory = '002'
+    DiscoveryData     = '003'
+    FileCollection    = '010'
+    IDMIFCollection   = '011'
+}
 
 $wasProvisioning = $false
+$failed = $false
 
 try {
-    Write-Log 'Starting ConfigMgr Inventory'
+    Write-Log 'Starting ConfigMgr client actions'
 
-    # Check current provisioning mode
-    $wasProvisioning = (Get-ItemProperty `
-        'HKLM:\SOFTWARE\Microsoft\CCM\CcmExec').ProvisioningMode -eq 'true'
+    # Validate and expand selected cycles
+    if ($Cycles -contains 'All') {
+        if ($Cycles.Count -ne 1) {
+            throw "'All' cannot be combined with other cycles."
+        }
+
+        $selected = @($cycleIds.Keys)
+    }
+    else {
+        $selected = @($Cycles | Select-Object -Unique)
+    }
+
+    foreach ($name in $selected) {
+        if (-not $cycleIds.Contains($name)) {
+            throw "Unknown cycle: $name"
+        }
+    }
+
+    Write-Log "Selected cycles: $($selected -join ', ')"
+
+    # Save existing inventory status for comparison
+    $previous = @{}
+
+    foreach ($name in $selected) {
+        if (-not $inventoryIds.ContainsKey($name)) {
+            continue
+        }
+
+        $id = '{00000000-0000-0000-0000-000000000' +
+              $inventoryIds[$name] + '}'
+
+        $state = Get-CimInstance -Namespace 'root\ccm\invagt' `
+            -ClassName InventoryActionStatus `
+            -Filter "InventoryActionID='$id'"
+
+        $lastStart = [datetime]::MinValue
+        $lastReport = [datetime]::MinValue
+
+        if ($state) {
+            if ($state.LastCycleStartedDate) {
+                $lastStart = $state.LastCycleStartedDate
+            }
+            if ($state.LastReportDate) {
+                $lastReport = $state.LastReportDate
+            }
+        }
+
+        $previous[$name] = @{
+            Started = $lastStart
+            Report  = $lastReport
+        }
+    }
+
+    # Temporarily disable provisioning mode
+    $wasProvisioning = [string](Get-ItemProperty `
+        'HKLM:\SOFTWARE\Microsoft\CCM\CcmExec').ProvisioningMode -eq 'True'
 
     if ($wasProvisioning) {
-        Invoke-CCMMethod 'SetClientProvisioningMode' @{ bEnable = $false }
+        Invoke-CCMMethod 'SetClientProvisioningMode' @{
+            bEnable = $false
+        }
         Write-Log 'Provisioning Mode disabled'
     }
     else {
         Write-Log 'Provisioning Mode already disabled'
     }
 
-    # Trigger inventory cycles
-    $started = Get-Date
+    # Trigger selected cycles
+    foreach ($name in $selected) {
+        $id = '{00000000-0000-0000-0000-000000000' +
+              $cycleIds[$name] + '}'
 
-    foreach ($action in $actions) {
         Invoke-CCMMethod 'TriggerSchedule' @{
-            sScheduleID = $action.Schedule
+            sScheduleID = $id
         }
-        Write-Log "Started: $($action.Name)"
+
+        Write-Log "Triggered: $name ($id)"
+
+        if (-not $inventoryIds.ContainsKey($name)) {
+            Write-Log "Completion cannot be verified: $name" -Type 2
+        }
     }
 
-    # Wait for inventory reporting
+    # Wait for inventory reports where supported
+    $pending = @($selected | Where-Object {
+        $inventoryIds.ContainsKey($_)
+    })
+
     $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
-    $pending = @($actions)
+
+    if ($pending.Count -gt 0) {
+        Write-Log "Waiting for inventory reports: $($pending -join ', ')"
+    }
 
     while ($pending.Count -gt 0 -and (Get-Date) -lt $deadline) {
-        foreach ($action in @($pending)) {
-            $status = Get-CimInstance -Namespace 'root\ccm\invagt' `
+        foreach ($name in @($pending)) {
+            $id = '{00000000-0000-0000-0000-000000000' +
+                  $inventoryIds[$name] + '}'
+
+            $state = Get-CimInstance -Namespace 'root\ccm\invagt' `
                 -ClassName InventoryActionStatus `
-                -Filter "InventoryActionID='$($action.Status)'"
+                -Filter "InventoryActionID='$id'"
 
-            if ($status -and
-                $status.LastCycleStartedDate -ge $started -and
-                $status.LastReportDate -ge $status.LastCycleStartedDate) {
+            if ($state -and
+                $state.LastCycleStartedDate -gt $previous[$name].Started -and
+                $state.LastReportDate -gt $previous[$name].Report -and
+                $state.LastReportDate -ge $state.LastCycleStartedDate) {
 
-                Write-Log "Completed: $($action.Name)"
-                $pending = @($pending | Where-Object { $_.Name -ne $action.Name })
+                Write-Log "Reported: $name"
+
+                $pending = @($pending | Where-Object {
+                    $_ -ne $name
+                })
             }
         }
 
@@ -121,25 +249,33 @@ try {
     }
 
     if ($pending.Count -gt 0) {
-        throw "Inventory timeout: $(($pending.Name) -join ', ')"
+        throw "Inventory timeout: $($pending -join ', ')"
     }
 
-    Write-Log 'All inventory cycles completed'
+    Write-Log 'Selected client actions processed'
 }
 catch {
+    $failed = $true
     Write-Log "ERROR: $($_.Exception.Message)" -Type 3
-    throw
 }
 finally {
     if ($wasProvisioning) {
         try {
-            Invoke-CCMMethod 'SetClientProvisioningMode' @{ bEnable = $true }
+            Invoke-CCMMethod 'SetClientProvisioningMode' @{
+                bEnable = $true
+            }
+
             Write-Log 'Provisioning Mode restored'
         }
         catch {
+            $failed = $true
             Write-Log "ERROR restoring Provisioning Mode: $($_.Exception.Message)" -Type 3
-            throw
         }
     }
 }
 
+if ($failed) {
+    exit 1
+}
+
+exit 0
